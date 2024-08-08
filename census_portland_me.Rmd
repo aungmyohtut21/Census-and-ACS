@@ -1,0 +1,465 @@
+---
+title: "Portland Census and ACS Survey Analysis"
+author: "Aung Myo Htut"
+date: "`r Sys.Date()`"
+output: 
+  prettydoc::html_pretty:
+    theme: architect
+    #code_folding: show
+    toc: yes
+    # toc_float:
+    #   collapsed: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 6)
+
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(tidycensus)
+library(tigris)
+library(sf)
+library(crsuggest)
+library(mapview)
+library(purrr)
+library(leaflet.extras2)
+library(leafsync)
+library(tmap)
+library(spdep)
+library(viridisLite)
+library(htmlwidgets)
+library(RColorBrewer)
+census_api_key("3d52d318441c65306dd6791d075c6bac33b419f5")
+options(tigris_use_cache = TRUE)
+``` 
+
+# INTRODUCTION
+The decennial census and the American Community Survey (ACS) are important tools used by the U.S. Census Bureau for demographic data collection, each serving distinct purposes. The decennial census, conducted every ten years, aims to count every person residing in the United States and gather fundamental demographic information such as age, sex, and race. This comprehensive count is essential for apportioning congressional representation and allocating federal funds. In contrast, the ACS is an annual survey that collects detailed demographic, social, economic, and housing data from a sample of the population. While the decennial census provides a complete enumeration, the ACS offers deeper insights into aspects like educational attainment and housing costs, supporting informed policy development, program administration, and business planning. I utilized both the decennial census and ACS data to map various characteristics for the city of Portland, Maine, enhancing our understanding of its demographic landscape and informing local decision-making.
+
+
+# DECENNIAL CENSUS
+
+
+```{r Cumber County Shape file Tracts}
+# Load Cumberland County Shape File
+cumberland_tracts <- tracts(state = "ME", county = "Cumberland", cb = TRUE, year = 2022)
+```
+
+
+```{r Load Variables}
+# Census Variables
+vars_dhc <- load_variables(2020,"dhc")
+vars_dp <- load_variables(2020, "dp")
+vars_ddhcca <- load_variables(2020, "ddhca")
+
+# ACS Variables
+vars_acs1 <- load_variables(2022,"acs1")
+vars_acs5 <- load_variables(2022, "acs5")
+vars_profile <- load_variables(2022,"acs5/profile") #data profile for variable lookup
+vars_subject <- load_variables(2022, "acs5/subject") #subject tables
+vars_cprofile <- load_variables(2022, "acs5/cprofile") #comparison profile
+```
+
+## MEDIAN AGE BY BOTH SEXES
+```{r median age}
+# Cumberland Tracts for Median Age by Both Sex
+cumberland_medianage <- get_decennial(
+  geography = "tract",
+  variables = "DP1_0073C",
+  state = "ME",
+  county = "Cumberland",
+  geometry = TRUE,
+  year = 2020,
+  sumfile = "dp"
+) 
+
+# County Subdivision for Race population percent
+subdiv_medianage <- get_decennial(
+  geography = "county subdivision",
+  variables = "DP1_0073C",
+  state = "ME",
+  county = "Cumberland",
+  geometry = TRUE,
+  year = 2020,
+  sumfile = "dp") %>% 
+  filter(str_detect(NAME, "^Portland"))
+
+# Ensure CRS matches for accurate spatial operation
+portland_transform <- st_transform(subdiv_medianage, st_crs(cumberland_medianage))
+
+# Use st_intersection to find tracts within Portland
+portland_interset <- st_intersection(cumberland_medianage, portland_transform)
+
+# Erase Water Data
+portland_medianage_erase <- erase_water(
+  portland_interset,
+  year = 2020
+)
+
+# Mapping
+mapview(portland_medianage_erase,
+        zcol = "value",
+        layer.name = "Median Age by Both Sexes in <br/> Portland City")
+```
+
+
+```{r Portland Shapefile by Tracts, include=FALSE}
+## Creating Portland Shape File
+portland_select <- portland_interset %>% 
+  select(c("GEOID", "NAME", "NAME.1","geometry"))
+
+# Filter tracts
+portland_tracts <- cumberland_tracts[cumberland_tracts$GEOID %in%  portland_select$GEOID,]
+
+
+#Export to Shape File
+#st_write(portland_tracts, "portland.shp")
+```
+
+
+## MALE AND FEMALE POPULATION 
+```{r male and female pop}
+# Cumberland Tracts for Male and Female Population
+cumberland_mfpop <- get_decennial(
+  geography = "tract",
+  variables = c(Male = "DP1_0025C", Female = "DP1_0049C"),
+  state = "ME",
+  county = "Cumberland",
+  geometry = TRUE,
+  year = 2020,
+  sumfile = "dp",
+  output = "wide"
+) 
+
+# Calculate the percentage of males and females
+cumberland_mfpop <- cumberland_mfpop %>%
+  mutate(
+    Total = Male + Female, 
+    Percent_Male = round((Male / Total) * 100,2),
+    Percent_Female = round((Female / Total) * 100,2)
+  )
+
+#Filter to keep only the rows that have matching GEOIDs
+portland_mfpop <- cumberland_mfpop %>% 
+  filter(GEOID %in% portland_tracts$GEOID)
+  
+portland_mfpop_erase <- erase_water(
+  portland_mfpop,
+  year = 2020
+)
+
+m <- mapview(portland_mfpop_erase, 
+             zcol = "Percent_Male",
+             at = c(30,50,70),
+             layer.name = "% Male Population",
+             col.regions = c("goldenrod","green"))
+f <-mapview(portland_mfpop_erase,
+            zcol = "Percent_Female", 
+            layer.name = "% Female Population",
+            at = c(30,50,80),
+            col.regions = c("blue","skyblue"))
+
+m | f
+
+```
+
+
+## TOTAL POPULATION
+```{r total pop}
+# First Total Population in Cumberland County
+cumb_pop <- get_decennial(
+  geography = "tract",
+  variables = "P1_001N",
+  year = 2020,
+  state = "ME",
+  county = "Cumberland",
+  sumfile = "dhc",
+  geometry = TRUE
+) %>% 
+  arrange(desc(value))
+
+
+# Filter GEOIDs that match in portland_tracts
+portland_pop <- cumb_pop %>% 
+  filter(GEOID %in% portland_tracts$GEOID)
+
+
+#Erase Water Area
+portland_pop_erase <- erase_water(portland_pop,year = 2020)
+
+colors <- plasma(n= 4)
+# Produce Map
+mapview(portland_pop_erase, zcol = "value",
+        at = seq(1000,9000,2000),
+        legend = TRUE,
+        col.regions = colors,
+        layer.name = "Portland Population")
+
+```
+
+
+# AMERICAN COMMUNITY SURVEY
+
+## MEDIAN HOUSEHOLD INCOME
+```{r income}
+cumberland_income <- get_acs(
+  geography = "tract",
+  variables = "DP03_0062", # Estimate total households with food stamp/snap benefits in the past 12 months
+  year = 2022,
+  state = "ME",
+  county = "Cumberland",
+  geometry = TRUE
+)
+
+# Filter GEOIDs that match in portland_tracts
+portland_income <- cumberland_income %>% 
+  filter(GEOID %in% portland_tracts$GEOID)
+
+# mean(portland_income$estimate)
+# min(portland_income$estimate)
+# max(portland_income$estimate)
+
+#Erase water area
+portland_income_erase <- erase_water(
+  portland_income,
+  area_threshold = 0.5,
+  year = 2020
+)
+
+#Mapping
+c1 = plasma(n=5, direction = -1)
+
+# ggplot(portland_income_erase) +
+#   geom_sf(color = "white", aes(fill = estimate)) +
+#   geom_sf_text(aes(label = estimate), size = 2.5, color = "yellow")+
+#   theme_void() 
+
+mapview(portland_income_erase,
+        zcol = "estimate",
+        at = seq(10000,110000,20000),
+        col.regions = c1,
+        layer.name = "Median Household Income <br/> in Portland")
+```
+
+## HOUSEHOLDS WITH SNAP BENEFITS
+```{r snap}
+cumberland_snap <- get_acs(
+  geography = "tract",
+  variables = "DP03_0074P",
+  state = "23",
+  county = "005",
+  year = 2022,
+  geometry = TRUE
+)
+
+# Filter GEOIDs that match in portland_tracts
+portland_snap <- cumberland_snap %>% 
+  filter(GEOID %in% portland_tracts$GEOID)
+
+#Erase Water Area
+portland_snap_erase <- erase_water(
+  portland_snap,
+  year = 2020
+)
+
+#Mapping
+c2 = rocket(n=6, alpha = 1, direction = -1)
+mapview(portland_snap_erase,
+        zcol = "estimate",
+        at = seq(0,30,5),
+        col.regions = c2,
+        layer.name = "% of Households with SNAP Benefits <br/> in Portland")
+```
+
+
+## HEALTH INSURANCE COVERAGE
+```{r insurance coverage}
+Cumberland_insurance <- get_acs(
+  geography = "tract",
+  variables = "DP03_0096P",
+  state = "23",
+  county = "005",
+  year = 2022,
+  geometry = TRUE
+)
+
+# Filter GEOIDs that match in portland_tracts
+portland_insurance <- Cumberland_insurance %>% 
+  filter(GEOID %in% portland_tracts$GEOID)
+
+#Erase Water Area
+portland_insurance_erase <- erase_water(
+  portland_insurance,
+  year = 2020
+)
+
+#Mapping
+c2 = viridis(n=6, alpha = 1, direction = -1)
+mapview(portland_insurance_erase,
+        zcol = "estimate",
+        at = seq(88,100,2),
+        col.regions = c2,
+        layer.name = "% of Households with Health Insurance <br/> Coverage in Portland")
+
+```
+
+## POPULATION OVER 25 YRS WITH BACHELOR'S DEGREE
+
+```{r education}
+Cumberland_education <- get_acs(
+  geography = "tract",
+  variables = "DP02_0065P",
+  state = "23",
+  county = "005",
+  year = 2022,
+  geometry = TRUE
+)
+
+# Filter GEOIDs that match in portland_tracts
+portland_education <- Cumberland_education %>% 
+  filter(GEOID %in% portland_tracts$GEOID)
+
+#Erase Water Area
+portland_education_erase <- erase_water(
+  portland_education,
+  year = 2020
+)
+
+#Mapping
+c3 = mako(n=5, alpha = 1, direction = -1)
+mapview(portland_education_erase,
+        zcol = "estimate",
+        at = seq(25,50,5),
+        col.regions = c3,
+        layer.name = "% of Population with Bachelor's <br/> Degree in Portland")
+
+```
+
+## DISABILITY STATUS
+```{r disability}
+# Disability status of Civilian Noninstitutionalized Population
+
+Cumberland_disability <- get_acs(
+  geography = "tract",
+  variables = "DP02_0076P",
+  state = "23",
+  county = "005",
+  year = 2022,
+  geometry = TRUE
+)
+
+# Filter GEOIDs that match in portland_tracts
+portland_disability <- Cumberland_disability %>% 
+  filter(GEOID %in% portland_tracts$GEOID)
+
+#Erase Water Area
+portland_disability_erase <- erase_water(
+  portland_disability,
+  year = 2020
+)
+
+#Mapping
+c4 = magma(n=5, alpha = 1, direction = -1)
+mapview(portland_disability_erase,
+        zcol = "estimate",
+        at = seq(0,30,5),
+        col.regions = c4,
+        layer.name = "% of Population 18-64 years <br/> with Disabiltiy in Portland")
+```
+
+## LANGUAGE SPOKEN
+```{r language}
+# % of Population 5 years and over language other than English
+Cumberland_language <- get_acs(
+  geography = "tract",
+  variables = "DP02_0114P",
+  state = "23",
+  county = "005",
+  year = 2022,
+  geometry = TRUE
+)
+
+# Filter GEOIDs that match in portland_tracts
+portland_language <- Cumberland_language %>% 
+  filter(GEOID %in% portland_tracts$GEOID)
+
+#Erase Water Area
+portland_language_erase <- erase_water(
+  portland_language,
+  year = 2020
+)
+
+#Mapping
+c5 = plasma(n=6, alpha = 1, direction = -1)
+mapview(portland_language_erase,
+        zcol = "estimate",
+        at = seq(0,30,5),
+        col.regions = c5,
+        layer.name = "% of Population 5 years and over with language <br/> other than English in Portland")
+```
+
+## FAMILY INCOME BELOW POVERTY LEVEL
+```{r poverty}
+# % of families and people whose income below the poverty level in the past 12 months
+Cumberland_poverty <- get_acs(
+  geography = "tract",
+  variables = "DP03_0119P",
+  state = "23",
+  county = "005",
+  year = 2022,
+  geometry = TRUE
+)
+
+# Filter GEOIDs that match in portland_tracts
+portland_poverty <- Cumberland_poverty %>% 
+  filter(GEOID %in% portland_tracts$GEOID)
+
+#Erase Water Area
+portland_poverty_erase <- erase_water(
+  portland_poverty,
+  year = 2020
+)
+
+#Mapping
+#c5 = plasma(n=6, alpha = 1, direction = -1)
+mapview(portland_poverty_erase,
+        zcol = "estimate",
+        at = seq(0,15,3),
+        col.regions = brewer.pal(5,"YlOrBr"),
+        layer.name = "% of Families And People Below <br/> Poverty Level in Portland")
+```
+
+## RENTER OCCUPIED HOUSING
+```{r housing}
+# Renter Occupied Housing Units
+Cumberland_rent <- get_acs(
+  geography = "tract",
+  variables = "DP04_0047P",
+  state = "23",
+  county = "005",
+  year = 2022,
+  geometry = TRUE
+)
+
+# Filter GEOIDs that match in portland_tracts
+portland_rent <- Cumberland_rent %>% 
+  filter(GEOID %in% portland_tracts$GEOID)
+
+#Erase Water Area
+portland_rent_erase <- erase_water(
+  portland_rent,
+  year = 2020
+)
+
+#Mapping
+#c5 = plasma(n=6, alpha = 1, direction = -1)
+mapview(portland_rent_erase,
+        zcol = "estimate",
+        at = seq(0,100,20),
+        col.regions = brewer.pal(5,"Blues"),
+        layer.name = "% of Renter Occupied Housing <br/> Units in Portland")
+```
+
